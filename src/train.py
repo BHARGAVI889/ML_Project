@@ -44,7 +44,12 @@ def build_labeled_pairs(train_dir: Path):
     cand2, _ = generate_candidates(s1, s2, "S2")
     cand3, _ = generate_candidates(s1, s3, "S3")
 
+    total_pairs = sum(len(v) for v in cand2.values()) + sum(len(v) for v in cand3.values())
+    print(f"[features] computing pairwise features for {total_pairs} candidate pairs...")
+
     rows = []
+    done = 0
+    report_every = max(total_pairs // 20, 1000)  # ~20 progress lines total
     for s1_id, s1_row in s1_lookup.items():
         true_matches = gt_map.get(s1_id, set())
         for other_id in cand2.get(s1_id, set()):
@@ -52,11 +57,19 @@ def build_labeled_pairs(train_dir: Path):
             feats.update(source1_entity_id=s1_id, other_entity_id=other_id,
                          label=int(other_id in true_matches))
             rows.append(feats)
+            done += 1
+            if done % report_every == 0:
+                print(f"[features] {done}/{total_pairs} pairs done "
+                      f"({100 * done / total_pairs:.0f}%)")
         for other_id in cand3.get(s1_id, set()):
             feats = pair_features(s1_row, s3_lookup[other_id])
             feats.update(source1_entity_id=s1_id, other_entity_id=other_id,
                          label=int(other_id in true_matches))
             rows.append(feats)
+            done += 1
+            if done % report_every == 0:
+                print(f"[features] {done}/{total_pairs} pairs done "
+                      f"({100 * done / total_pairs:.0f}%)")
 
     df = pd.DataFrame(rows)
     # Recall check: how many ground-truth matches survived blocking?

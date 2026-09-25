@@ -1,110 +1,77 @@
 """
-Blocking / candidate generation.
+Blocking / candidate generation — scalable version.
 
-Strategy (all within-country, since cross-country matches are essentially
-impossible for real businesses and this collapses the search space a lot):
-  1. TF-IDF character n-gram cosine similarity on normalized business_name
-     -> top-K nearest neighbors per Source-1 entity, per candidate source.
-     Computed as a sparse matrix product with a per-row top-k extraction,
-     so we never materialize a dense N x M similarity matrix in memory —
-     that dense-matrix blowup is what causes multi-GB memory use on large
-     datasets.
-  2. A cheap exact/near-exact token-overlap block as a recall safety net,
-     so we don't miss matches TF-IDF ranks low but that share rare tokens
-     (e.g. a distinctive brand word). Very common tokens are skipped so a
-     single frequent word (e.g. "international") can't blow up every
-     candidate set at once.
-Both candidate sets are unioned. This union IS what should end up in
-candidate_pairs.tsv, since it's the exact set fed to the matching model.
+At this dataset's scale (millions of S1 rows, millions of S2/S3 rows),
+brute-force pairwise comparison — including TF-IDF cosine similarity via
+sklearn's NearestNeighbors, which is exact/exhaustive under the hood — is
+NOT viable: it's an O(n * m) matrix computation per country, and a single
+country group of a few hundred thousand rows on each side already means
+tens of billions of comparisons. That's what was hanging the pipeline.
+
+Instead we use classic record-linkage BLOCKING KEYS: cheap, deterministic
+functions of the normalized name that partition records into small
+buckets, so we only ever compare records that land in the same bucket.
+Bucket construction is a single pass over the data (dict/hashmap), i.e.
+O(n), not O(n*m).
+
+Keys used (union of all three, each computed within country):
+  1. name_prefix  -> first `prefix_len` chars of the normalized name
+                     (catches near-identical names / minor suffix noise)
+  2. first_token  -> first whitespace-delimited token of the normalized
+                     name (catches reordered/truncated names that still
+                     start the same way)
+  3. rare_token   -> any token (len >= min_token_len) that is NOT
+                     extremely common (document frequency <= max_df on
+                     the "other" side) — a safety net for names that
+                     share a distinctive word but not a prefix/first token
+
+Any bucket whose "other" side exceeds `max_block_size` is dropped
+entirely rather than kept: a bucket that large has essentially zero
+discriminative power (e.g. hundreds of businesses sharing a common
+prefix), so keeping it only costs time/memory downstream for no recall
+benefit. This is what makes the whole thing scale — tune
+`max_block_size` down if a country's buckets are still too large (watch
+the printed avg/max candidates-per-entity diagnostic).
 """
 from collections import defaultdict
 
-import numpy as np
-from scipy import sparse
-from sklearn.feature_extraction.text import TfidfVectorizer
-
 from data_utils import normalize_name, token_set
 
-# Cap on TF-IDF vocabulary size per country group. Without this, a large
-# corpus of char n-grams (2-4 chars) can create a huge sparse matrix and
-# blow up memory during the similarity computation.
-MAX_TFIDF_FEATURES = 20_000
-# A token that appears in more than this fraction of records is too common
-# to be a useful blocking key (and would create huge candidate sets).
-MAX_TOKEN_DOC_FREQ_RATIO = 0.02
+
+def _prefix_key(name: str, n: int) -> str:
+    return name[:n] if name else ""
 
 
-def _tfidf_topk(s1_names, other_names, top_k=15, row_batch_size=2000):
-    """
-    Return, for each s1 index, a list of (other_idx, cosine_sim), computed
-    via sparse matrix multiplication in row batches so memory stays bounded
-    regardless of corpus size.
-    """
-    if not other_names or not s1_names:
-        return [[] for _ in s1_names]
-
-    vectorizer = TfidfVectorizer(
-        analyzer="char_wb", ngram_range=(2, 4), min_df=2,
-        max_features=MAX_TFIDF_FEATURES, dtype=np.float32,
-    )
-    all_text = s1_names + other_names
-    tfidf = vectorizer.fit_transform(all_text)
-    s1_vec = tfidf[: len(s1_names)]
-    other_vec = tfidf[len(s1_names):]
-    other_vec_t = other_vec.T.tocsr()  # for fast sparse matmul below
-
-    k = min(top_k, other_vec.shape[0])
-    results = [[] for _ in range(len(s1_names))]
-
-    for start in range(0, s1_vec.shape[0], row_batch_size):
-        end = min(start + row_batch_size, s1_vec.shape[0])
-        # sparse (batch x vocab) @ (vocab x other) -> sparse (batch x other)
-        sims_batch = (s1_vec[start:end] @ other_vec_t).tocsr()
-        for local_i in range(sims_batch.shape[0]):
-            row = sims_batch.getrow(local_i)
-            if row.nnz == 0:
-                continue
-            # top-k within this row's nonzero entries only
-            if row.nnz > k:
-                top_local = np.argpartition(row.data, -k)[-k:]
-            else:
-                top_local = np.arange(row.nnz)
-            cols = row.indices[top_local]
-            vals = row.data[top_local]
-            results[start + local_i] = list(zip(cols.tolist(), vals.tolist()))
-
-    return results
+def _first_token_key(name: str) -> str:
+    return name.split()[0] if name else ""
 
 
-def _token_block(s1_norm_names, other_norm_names, min_token_len=4):
-    """Inverted index on tokens length >= min_token_len -> set of candidate indices sharing a rare-but-not-too-rare token."""
-    inv_index = defaultdict(list)
-    for j, name in enumerate(other_norm_names):
-        for tok in token_set(name):
-            if len(tok) >= min_token_len:
-                inv_index[tok].append(j)
-
-    # Drop tokens that are too common to be a useful blocking key —
-    # these are what cause runaway candidate-set sizes / memory use.
-    max_doc_freq = max(5, int(MAX_TOKEN_DOC_FREQ_RATIO * max(len(other_norm_names), 1)))
-    inv_index = {tok: ids for tok, ids in inv_index.items() if len(ids) <= max_doc_freq}
-
-    result = []
-    for name in s1_norm_names:
-        cand = set()
-        for tok in token_set(name):
-            if len(tok) >= min_token_len:
-                cand.update(inv_index.get(tok, []))
-        result.append(cand)
-    return result
+def _build_bucket_index(other_ids, other_keys, max_block_size):
+    """other_ids/other_keys: parallel lists. Returns {key: [other_id, ...]},
+    dropping any bucket bigger than max_block_size."""
+    buckets = defaultdict(list)
+    for oid, key in zip(other_ids, other_keys):
+        if key:
+            buckets[key].append(oid)
+    return {k: v for k, v in buckets.items() if len(v) <= max_block_size}
 
 
-def generate_candidates(s1_df, other_df, other_source_label, top_k=15, sim_threshold=0.15):
+def _apply_bucket_index(s1_ids, s1_keys, bucket_index, candidates):
+    for sid, key in zip(s1_ids, s1_keys):
+        hits = bucket_index.get(key)
+        if hits:
+            candidates[sid].update(hits)
+
+
+def generate_candidates(
+    s1_df, other_df, other_source_label,
+    prefix_len=4, min_token_len=4, max_block_size=300,
+):
     """
     Generate candidate matches from `other_df` (source2 or source3) for every
-    row in `s1_df`, grouped by country.
+    row in `s1_df`, grouped by country, using key-based blocking.
 
-    Returns: dict {source1_entity_id: set(other_entity_id)}
+    Returns: (dict {source1_entity_id: set(other_entity_id)}, other_source_label)
     """
     s1_df = s1_df.copy()
     other_df = other_df.copy()
@@ -123,21 +90,44 @@ def generate_candidates(s1_df, other_df, other_source_label, top_k=15, sim_thres
         other_ids = other_group["entity_id"].tolist()
         other_names = other_group["_norm_name"].tolist()
 
-        # 1) TF-IDF nearest neighbors
-        topk_results = _tfidf_topk(s1_names, other_names, top_k=top_k)
-        for i, s1_id in enumerate(s1_ids):
-            for j, sim in topk_results[i]:
-                if sim >= sim_threshold:
-                    candidates[s1_id].add(other_ids[j])
+        # 1) name-prefix blocking
+        s1_prefix = [_prefix_key(n, prefix_len) for n in s1_names]
+        other_prefix = [_prefix_key(n, prefix_len) for n in other_names]
+        idx = _build_bucket_index(other_ids, other_prefix, max_block_size)
+        _apply_bucket_index(s1_ids, s1_prefix, idx, candidates)
 
-        # 2) Rare-token overlap safety net
-        token_results = _token_block(s1_names, other_names)
-        for i, s1_id in enumerate(s1_ids):
-            for j in token_results[i]:
-                candidates[s1_id].add(other_ids[j])
+        # 2) first-token blocking
+        s1_first = [_first_token_key(n) for n in s1_names]
+        other_first = [_first_token_key(n) for n in other_names]
+        idx = _build_bucket_index(other_ids, other_first, max_block_size)
+        _apply_bucket_index(s1_ids, s1_first, idx, candidates)
+
+        # 3) rare-token overlap safety net (exploded: one entity can hit
+        #    several buckets, one per qualifying token in its name)
+        other_tok_buckets = defaultdict(list)
+        for oid, name in zip(other_ids, other_names):
+            for tok in token_set(name):
+                if len(tok) >= min_token_len:
+                    other_tok_buckets[tok].append(oid)
+        other_tok_buckets = {
+            tok: ids for tok, ids in other_tok_buckets.items()
+            if len(ids) <= max_block_size
+        }
+        for sid, name in zip(s1_ids, s1_names):
+            for tok in token_set(name):
+                if len(tok) >= min_token_len:
+                    hits = other_tok_buckets.get(tok)
+                    if hits:
+                        candidates[sid].update(hits)
 
     # Ensure every s1 entity has an entry (possibly empty)
     for s1_id in s1_df["entity_id"]:
         candidates.setdefault(s1_id, set())
+
+    sizes = [len(v) for v in candidates.values()]
+    total = sum(sizes)
+    print(f"[blocking:{other_source_label}] {len(candidates)} S1 entities -> "
+          f"{total} candidate pairs (avg {total / max(len(sizes), 1):.1f}/entity, "
+          f"max {max(sizes) if sizes else 0}/entity)")
 
     return candidates, other_source_label
